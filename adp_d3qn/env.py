@@ -1,186 +1,264 @@
 import numpy as np
 import torch
+from typing import Tuple, Dict, Any
+
 from model.base_model import BaseMultiExitModel
 from adp_d3qn.metrics import calculate_avg_delay, calculate_task_completion_rate
 
+
 class VECEnv:
     """
-    车边协同环境（论文4.2节MDP建模：S,A,P,R,γ）
-    模拟VEC场景中任务到达、资源约束、延迟计算等核心逻辑
+    Vehicle–Edge Collaborative Environment
+    --------------------------------------
+    对应论文 Section IV-B 的 MDP 定义 S,A,P,R,γ
+    - 状态 s(t) = (ac(t), queue_e(t), c_e^rm(t), λ(t))
+    - 动作 a(t) = (par(t), exit(t))  其中 par∈{0..l}, exit∈{-1..n_exits-1}
+      这里将 (par, exit) 映射为一个“扁平离散动作”，维度随模型动态变化：
+        action_dim = (l + 1) * (n_exits + 1)
+    - 转移包含：车端/边缘推理、M/D/1 排队、通信
     """
-    def __init__(self, model: BaseMultiExitModel, dataloader, config):
+
+    def __init__(self, model: BaseMultiExitModel, dataloader, config: Dict[str, Any]):
         """
-        :param model: 多出口DNN模型（AlexNet/VGG16）
-        :param dataloader: 数据加载器（BDD100K）
-        :param config: 配置字典（论文1-147表格参数）
+        :param model: 多出口 DNN 模型（AlexNet/VGG16/…）
+            需提供：
+              - model.backbone: list-like, 主干层集合（用于计算 l）
+              - model.exit_layers: list-like, 各出口分类头（用于计算 n_exits）
+              - model.partition_model(k): -> (vehicle_model, edge_model)
+        :param dataloader: BDD100K 的数据加载器（返回 dict: {"image","label"}）
+        :param config: 实验参数（全部可在 config.py 中改）
         """
         self.model = model
         self.dataloader = dataloader
-        self.config = config
+        self.cfg = config
+        self.device = torch.device(self.cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
-        # 论文核心参数（1-147表格）
-        self.num_vehicles = config["num_vehicles"]  # 车辆数量（5-30）
-        self.edge_resource = config["edge_resource"]  # 边缘计算资源（15GHz）
-        self.vehicle_resource = config["vehicle_resource"]  # 车端计算资源（1.5GHz）
-        self.bandwidth = config["bandwidth"]  # 通信带宽（5-25Mbps）
-        self.delay_tolerate = config["delay_tolerate"]  # 容忍延迟（AlexNet25ms/VGG16250ms）
-        self.ac_min = config["ac_min"]  # 最小推理精度（0.8）
-        self.per_layer_compute = 0.1  # 每层计算量（GOPS，论文3.2节）
+        # === 动态动作空间 ===
+        self.num_layers = int(len(getattr(self.model, "backbone")))
+        self.num_exits = int(len(getattr(self.model, "exit_layers", [])))  # 可能为 0
+        # par(t)∈[0..l]；exit∈{-1..num_exits-1}，我们把 "-1(不早退)" 平移为索引0
+        self.action_dim = (self.num_layers + 1) * (self.num_exits + 1)
 
-        # MDP五要素初始化（论文4.2节）
-        self.state_dim = 4  # 状态维度：s(t)=(ac(t), queue_e(t), c_e^rm(t), λ(t))
-        self.action_dim = len(model.backbone) + 1  # 动作维度：划分点数量（0到l）
-        self.gamma = config["gamma"]  # 折扣因子（0.9，1-147表格）
+        # === 状态空间（固定4维，但归一化阈值可配） ===
+        self.state_dim = 4
 
-        # 环境状态初始化
+        # === 论文关键参数（全部可配，不写死） ===
+        # 车辆数、资源、带宽、阈值等（对应 Table III）
+        self.num_vehicles = self.cfg.get("num_vehicles", 10)
+        self.edge_resource = float(self.cfg.get("edge_resource", 15.0))         # Ce (GHz)
+        self.vehicle_resource = float(self.cfg.get("vehicle_resource", 1.5))    # Ci (GHz)
+        self.bandwidth_mbps = float(self.cfg.get("bandwidth", 20.0))            # Brv (Mbps)
+        self.delay_tolerate = float(self.cfg.get("delay_tolerate", 25.0))       # (ms)
+        self.ac_min = float(self.cfg.get("ac_min", 0.8))                        # ac_min ∈ (0,0.8]
+        self.gamma = float(self.cfg.get("gamma", 0.9))
+
+        # 每层计算量（GOPS），若未配置则回退 0.1
+        self.per_layer_compute = float(self.cfg.get("per_layer_compute", 0.1))
+
+        # 队列归一化上限、到达率范围
+        self.queue_norm_cap = int(self.cfg.get("queue_norm_cap", 50))
+        self.arrival_rate_range = tuple(self.cfg.get("arrival_rate_range", (0.15, 0.25)))  # [15%,25%]
+        self.arrival_rate_sigma = float(self.cfg.get("arrival_rate_sigma", 0.01))
+
+        # 过载惩罚（用于防止 service_rate<=arrival_rate 的数值爆炸）
+        self.edge_overload_penalty = float(self.cfg.get("edge_overload_penalty", 1e6))
+
+        # 奖励权重（可在 config 中调参对齐论文消融）
+        self.reward_alpha = float(self.cfg.get("reward_alpha", 0.5))  # 完成率
+        self.reward_beta = float(self.cfg.get("reward_beta", 0.3))    # 精度
+
         self.reset()
 
-    def reset(self):
-        """重置环境状态（论文4.2节状态空间定义）"""
-        # 1. 当前推理精度（ac(t)∈[ac_min,1]）
-        self.current_ac = np.random.uniform(self.ac_min, 1.0)
-        # 2. 边缘队列长度（queue_e(t)，初始0）
-        self.edge_queue = 0
-        # 3. 边缘剩余资源（c_e^rm(t)，初始为总资源）
-        self.edge_remaining_resource = self.edge_resource
-        # 4. 任务到达率（λ(t)∈[15%,25%]，1-147表格）
-        self.task_arrival_rate = np.random.uniform(0.15, 0.25)
+    # ------------------------ 公共接口 ------------------------
 
-        # 数据迭代器重置
+    def reset(self) -> torch.Tensor:
+        """重置环境状态 —— 对应 Section IV-B 的状态定义"""
+        self.current_ac = float(np.random.uniform(self.ac_min, 1.0))         # ac(t)
+        self.edge_queue = 0                                                  # queue_e(t)
+        self.edge_remaining_resource = float(self.edge_resource)             # c_e^rm(t)
+        low, high = self.arrival_rate_range
+        self.task_arrival_rate = float(np.random.uniform(low, high))         # λ(t)
+
         self.data_iter = iter(self.dataloader)
         return self._get_state()
 
-    def _get_state(self):
-        """获取归一化状态（论文4.2节状态空间）"""
-        state = np.array([
-            self.current_ac,  # 精度（已归一化）
-            min(self.edge_queue / 50, 1.0),  # 队列长度（最大50，归一化到[0,1]）
-            self.edge_remaining_resource / self.edge_resource,  # 剩余资源占比
-            self.task_arrival_rate / 0.25  # 任务到达率（最大25%，归一化到[0,1]）
-        ], dtype=np.float32)
-        return torch.tensor(state, dtype=torch.float32)
-
-    def _calculate_reward(self, avg_delay, task_completion_rate, current_ac):
+    def step(self, action: int):
         """
-        奖励函数（论文4.2节：R(t) = -delay_avg + α·completion_rate + β·ac）
-        :param avg_delay: 平均延迟（ms）
-        :param task_completion_rate: 任务完成率
-        :param current_ac: 当前精度
-        :return: 奖励值
+        环境一步交互 —— 对应 Section IV-B 的转移
+        :param action: 扁平离散动作索引 ∈ [0, action_dim-1]
+        :return: (next_state, reward, done, info)
         """
-        alpha = 0.5  # 完成率权重
-        beta = 0.3   # 精度权重
-        # 延迟惩罚（归一化到[-1,0]）
-        delay_penalty = -avg_delay / self.delay_tolerate
-        # 完成率奖励（[0,0.5]）
-        completion_reward = alpha * task_completion_rate
-        # 精度奖励（[0,0.3]）
-        ac_reward = beta * current_ac
-        return delay_penalty + completion_reward + ac_reward
-
-    def step(self, action):
-        """
-        环境一步交互（论文4.2节MDP转移）
-        :param action: 动作（[partition_point, exit_idx]）
-        :return: next_state, reward, done, info（延迟、完成率等）
-        """
-        partition_point, exit_idx = action
+        par, exit_idx = self._decode_action(action)
         done = False
 
-        # 1. 模型划分（车端+边缘端，论文3.2节）
-        vehicle_model, edge_model = self.model.partition_model(partition_point)
+        # 1) 模型划分（Section III-B）
+        vehicle_model, edge_model = self.model.partition_model(par)
 
-        # 2. 加载当前批次数据（BDD100K）
+        # 2) 取一批数据（BDD100K）
         try:
             batch = next(self.data_iter)
         except StopIteration:
             self.data_iter = iter(self.dataloader)
             batch = next(self.data_iter)
-        imgs = batch["image"].to(self.config["device"])
-        labels = batch["label"].to(self.config["device"])
 
-        # 3. 车端推理（含早退出判断，论文3.4节）
+        imgs = batch["image"].to(self.device, non_blocking=True)
+        labels = batch.get("label", None)
+        if labels is not None:
+            labels = labels.to(self.device, non_blocking=True)
+
+        # 3) 推理与早退（Section III-C）
         with torch.no_grad():
             vehicle_feat = vehicle_model(imgs)
-            if exit_idx != -1 and exit_idx < len(self.model.exit_layers):
-                # 早退出：车端直接输出结果
-                exit_prob = self.model.exit_layers[exit_idx](vehicle_feat)
-                self.current_ac = torch.mean(torch.max(exit_prob, dim=1)[0]).item()
-                vehicle_delay = self._calculate_vehicle_delay(partition_point)
-                edge_delay = 0.0
-                transmission_delay = 0.0
-            else:
-                # 无早退出：车端→边缘端传输+边缘推理
-                transmission_delay = self._calculate_transmission_delay(vehicle_feat)
-                edge_feat = edge_model(vehicle_feat)
-                main_prob = torch.nn.functional.softmax(edge_feat, dim=1)
-                self.current_ac = torch.mean(torch.max(main_prob, dim=1)[0]).item()
-                vehicle_delay = self._calculate_vehicle_delay(partition_point)
-                edge_delay = self._calculate_edge_delay(partition_point)
 
-        # 4. 计算核心指标（论文5.4节指标）
+            if exit_idx >= 0 and exit_idx < self.num_exits:
+                # 早退：在车端分支退出（对应 Eq.(1) 的早退概率逻辑的实现位点）
+                exit_probs = self.model.exit_layers[exit_idx](vehicle_feat)          # (B, C)
+                exit_probs = torch.softmax(exit_probs, dim=1)
+                self.current_ac = float(torch.mean(exit_probs.max(dim=1).values).item())
+                vehicle_delay = self._vehicle_delay(par)                             # Eq.(9)/(10) 期望近似
+                edge_delay = 0.0
+                transmission_delay = 0.0                                             # Eq.(6) 无传输
+            else:
+                # 不早退：传输中间特征到边缘 + 边缘主出口预测
+                transmission_delay = self._transmission_delay(vehicle_feat)          # Eq.(5)/(6)
+                edge_feat = edge_model(vehicle_feat)
+                main_probs = torch.softmax(edge_feat, dim=1)
+                self.current_ac = float(torch.mean(main_probs.max(dim=1).values).item())
+                vehicle_delay = self._vehicle_delay(par)
+                edge_delay = self._edge_delay(par)                                   # Eq.(8) M/D/1
+
+        # 4) 核心指标（Section V-C）
         total_delay = vehicle_delay + transmission_delay + edge_delay
-        avg_delay = calculate_avg_delay(total_delay, self.num_vehicles)
+        avg_delay = calculate_avg_delay(total_delay, self.num_vehicles)              # Eq.(14)
         task_completion_rate = calculate_task_completion_rate(avg_delay, self.delay_tolerate)
 
-        # 5. 更新环境状态（论文4.2节状态转移）
-        self.edge_queue = max(0, self.edge_queue + int(self.num_vehicles * self.task_arrival_rate) - 1)
-        self.edge_remaining_resource = max(0, self.edge_remaining_resource -
-                                           (partition_point / len(self.model.backbone)) * self.edge_resource)
-        self.task_arrival_rate = np.clip(self.task_arrival_rate + np.random.normal(0, 0.01), 0.15, 0.25)
+        # 5) 状态转移（队列/资源/到达率演化）
+        self._evolve_system(par)
 
-        # 6. 计算奖励
-        reward = self._calculate_reward(avg_delay, task_completion_rate, self.current_ac)
+        # 6) 奖励（R(t) = -delay_avg + α·completion + β·ac）
+        reward = self._reward(avg_delay, task_completion_rate, self.current_ac)
 
-        # 7. 终止条件（精度低于阈值或资源耗尽，论文约束）
+        # 7) 终止条件（精度/资源）
         if self.current_ac < self.ac_min or self.edge_remaining_resource <= 0:
             done = True
 
-        return self._get_state(), reward, done, {
-            "avg_delay": avg_delay,
-            "task_completion_rate": task_completion_rate,
-            "current_ac": self.current_ac
+        info = {
+            "avg_delay": float(avg_delay),
+            "task_completion_rate": float(task_completion_rate),
+            "current_ac": float(self.current_ac),
+            "vehicle_delay": float(vehicle_delay),
+            "edge_delay": float(edge_delay),
+            "transmission_delay": float(transmission_delay),
+            "par": int(par),
+            "exit_idx": int(exit_idx)
         }
+        return self._get_state(), float(reward), bool(done), info
 
-    def _calculate_vehicle_delay(self, partition_point):
-        """
-        车端延迟计算（论文3.5节延迟模型：delay = 计算量 / 车端资源）
-        :param partition_point: 划分点（车端执行层数）
-        :return: 车端延迟（ms）
-        """
-        compute_load = partition_point * self.per_layer_compute  # 总计算量（GOPS）
-        delay = (compute_load / self.vehicle_resource) * 1000  # 转换为ms
-        return delay
+    # ------------------------ 内部函数 ------------------------
 
-    def _calculate_edge_delay(self, partition_point):
+    def _decode_action(self, a: int) -> Tuple[int, int]:
         """
-        边缘延迟计算（论文3.5节M/D/1队列模型：处理延迟+队列延迟）
-        :param partition_point: 划分点（边缘端执行层数）
-        :return: 边缘延迟（ms）
+        将扁平离散动作索引 a 还原为 (par, exit)
+        - par ∈ [0..l]
+        - exit ∈ {-1..num_exits-1}   # 其中 -1 表示“不早退”
         """
-        remaining_layers = len(self.model.backbone) - partition_point
-        compute_load = remaining_layers * self.per_layer_compute  # 边缘计算量（GOPS）
-        # 服务率（论文公式8：μ(t)=C_e/∑c_j）
-        service_rate = self.edge_resource / compute_load  # 任务/ms
-        # 到达率（任务/ms）
-        arrival_rate = self.task_arrival_rate * self.num_vehicles
+        exits_plus = self.num_exits + 1
+        par = a // exits_plus
+        exit_flat = a % exits_plus
+        exit_idx = exit_flat - 1      # 将 [0..num_exits] 平移到 [-1..num_exits-1]
+        # 边界保护
+        par = int(np.clip(par, 0, self.num_layers))
+        exit_idx = int(np.clip(exit_idx, -1, self.num_exits - 1))
+        return par, exit_idx
 
-        if service_rate <= arrival_rate:
-            return float("inf")  # 边缘过载，延迟无穷大
+    def _get_state(self) -> torch.Tensor:
+        """归一化状态向量 s(t)=(ac, queue, c_e^rm, λ)"""
+        q_cap = max(1, self.queue_norm_cap)
+        low, high = self.arrival_rate_range
+        # 归一化
+        state = np.array([
+            np.clip(self.current_ac, 0.0, 1.0),                          # ac ∈ [0,1]
+            np.clip(self.edge_queue / q_cap, 0.0, 1.0),                  # queue
+            np.clip(self.edge_remaining_resource / self.edge_resource, 0.0, 1.0),
+            np.clip((self.task_arrival_rate - low) / (high - low + 1e-9), 0.0, 1.0)
+        ], dtype=np.float32)
+        return torch.from_numpy(state)
 
-        # M/D/1延迟公式（论文公式8）
-        process_delay = 1 / service_rate  # 处理延迟
-        queue_delay = arrival_rate / (2 * service_rate * (service_rate - arrival_rate))  # 队列延迟
-        return process_delay + queue_delay
+    def _reward(self, avg_delay: float, completion_rate: float, current_ac: float) -> float:
+        """
+        奖励函数：
+          R(t) = - delay_avg / delay_tolerate + α·completion_rate + β·ac
+        """
+        delay_penalty = - avg_delay / (self.delay_tolerate + 1e-9)
+        return delay_penalty + self.reward_alpha * completion_rate + self.reward_beta * current_ac
 
-    def _calculate_transmission_delay(self, feat):
+    def _evolve_system(self, par: int) -> None:
+        """队列长度、剩余资源、到达率的演化（近似模拟）"""
+        # 队列：本轮到达任务 - 已服务 1 个（近似）
+        arrivals = int(max(0, round(self.num_vehicles * self.task_arrival_rate)))
+        self.edge_queue = max(0, self.edge_queue + arrivals - 1)
+
+        # 剩余资源：用已在边缘端执行的层数占比粗略扣减
+        edge_layers = max(0, self.num_layers - par)
+        use_ratio = edge_layers / max(1, self.num_layers)
+        self.edge_remaining_resource = max(0.0, self.edge_remaining_resource - use_ratio * 0.1 * self.edge_resource)
+
+        # 到达率：加入噪声并裁剪在合法范围
+        low, high = self.arrival_rate_range
+        self.task_arrival_rate = float(np.clip(
+            self.task_arrival_rate + np.random.normal(0.0, self.arrival_rate_sigma),
+            low, high
+        ))
+
+    # ----- 各项延迟近似（对应论文方程处给出对齐注释） -----
+
+    def _vehicle_delay(self, par: int) -> float:
         """
-        传输延迟计算（论文3.6节通信模型：delay = 数据量 / 带宽）
-        :param feat: 车端输出中间特征
-        :return: 传输延迟（ms）
+        车端处理延迟（近似 Eq.(9)/(10)）
+          delay_icv(t) ≈ (∑_{j=1..par} c_j) / Ci
+        这里用每层恒定计算量 per_layer_compute 近似 ∑ c_j
+        返回单位：ms
         """
-        # 特征数据量（MB，float32=4字节）
-        data_size = feat.nelement() * 4 / (1024 * 1024)
-        # 传输延迟（ms，带宽单位：Mbps）
-        delay = (data_size * 8) / self.bandwidth * 1000
-        return delay
+        if par <= 0:
+            return 0.0
+        compute_load = par * self.per_layer_compute        # GOPS
+        delay_s = compute_load / max(self.vehicle_resource, 1e-9)  # s
+        return float(delay_s * 1000.0)
+
+    def _edge_delay(self, par: int) -> float:
+        """
+        边缘端排队+处理延迟（Eq.(8)：M/D/1）
+          delay_oper(t) = 1/μ + λ / [2μ(μ-λ)]
+          其中 μ = Ce / (∑_{j=par..l} c_j)
+               λ ≈ 车辆任务到达率 * 车辆数（单位：任务/时间）
+        为避免极端数值不稳，当 μ<=λ 时返回一个大惩罚。
+        返回单位：ms
+        """
+        remaining_layers = max(0, self.num_layers - par)
+        if remaining_layers == 0:
+            return 0.0
+
+        compute_load = remaining_layers * self.per_layer_compute         # GOPS
+        mu = self.edge_resource / max(compute_load, 1e-9)                # “任务/秒”的近似
+        lam = self.task_arrival_rate * self.num_vehicles                  # “任务/秒”的近似
+
+        if mu <= lam:   # 过载：给极大延迟（或你可选择截断/软惩罚）
+            return float(self.edge_overload_penalty)
+
+        process = 1.0 / mu
+        queue = lam / (2.0 * mu * (mu - lam) + 1e-9)
+        return float((process + queue) * 1000.0)
+
+    def _transmission_delay(self, feat: torch.Tensor) -> float:
+        """
+        通信/传输延迟（Eq.(5)/(6)）
+          delay_trans = data_size(bits) / bandwidth(bits/s)
+        用中间特征张量大小估算传输数据量（float32=4字节）
+        返回单位：ms
+        """
+        with torch.no_grad():
+            num_elems = int(feat.numel())
+        data_mb = (num_elems * 4) / (1024.0 * 1024.0)     # MB
+        bw_mbps = max(self.bandwidth_mbps, 1e-6)          # Mbps
+        delay_s = (data_mb * 8.0) / bw_mbps               # 秒
+        return float(delay_s * 1000.0)

@@ -1,183 +1,257 @@
-import torch
+from typing import Dict, Any, Optional
 import time
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from collections import deque
+
 from model.base_model import BaseMultiExitModel
-from adp_d3qn.metrics import calculate_inference_accuracy
 from adp_d3qn.model_partition import get_edge_model_layers
 
 
 class EdgeInference:
-    def __init__(self, model: BaseMultiExitModel, config):
-        """
-        边缘端推理器（论文M/D/1队列模型+剩余层计算）
-        :param model: 多出口DNN模型（论文中AlexNet/VGG16）
-        :param config: 配置字典（含边缘资源、队列容量等论文参数）
-        """
+    """
+    边缘端推理器（Edge-side）
+    --------------------------------------------------------------
+    对应论文 Section IV-D：
+      - 划分点之后的剩余层在边缘端执行
+      - M/D/1 队列延迟模型 (Eq.8): delay = 1/μ + λ/[2μ(μ-λ)]
+      - 服务率 μ(t) = C_e / (Σ c_j)  (剩余层计算量)
+      - 到达率 λ(t) 由系统演化/入队过程驱动
+    """
+
+    def __init__(self, model: BaseMultiExitModel, config: Dict[str, Any]):
         self.model = model
-        self.device = config["edge_device"]  # 边缘端设备（论文用GPU加速）
-        self.model.to(self.device)
-        self.model.eval()  # 推理模式
+        self.device = torch.device(config.get("edge_device", "cuda" if torch.cuda.is_available() else "cpu"))
+        self.model.to(self.device).eval()
 
-        # 论文核心参数
-        self.edge_resource = config["edge_resource"]  # 边缘计算资源（论文中15GHz）
-        self.queue_capacity = config["edge_queue_capacity"]  # 队列容量（论文设为50）
-        self.service_rate = 0.0  # 服务率（论文公式8：μ(t)=C_e/∑c_j）
-        self.task_arrival_rate = config["initial_task_arrival_rate"]  # 初始任务到达率（15%-25%）
+        # === 参数全来自 config 或模型 ===
+        self.edge_resource = float(config.get("edge_resource", 15.0))               # C_e (GHz)
+        self.queue_capacity = int(config.get("edge_queue_capacity", 50))            # 队列容量（监控指标）
+        self.arrival_low, self.arrival_high = tuple(config.get("arrival_rate_range", (0.15, 0.25)))
+        self.arrival_sigma = float(config.get("arrival_rate_sigma", 0.01))          # 到达率噪声
+        self.ac_min = float(config.get("ac_min", 0.8))
+        self.per_layer_compute = float(config.get("per_layer_compute", 0.1))        # GOPS（若无 layer-wise 统计时的兜底）
+        self.energy_factor = float(config.get("edge_energy_per_gop", 0.04))         # J/GOP
+        self.initial_partition_point = int(config.get("initial_partition_point", 0))
 
-        # M/D/1队列初始化（论文3.5节延迟模型）
-        self.task_queue = deque(maxlen=self.queue_capacity)
-        self.current_partition_point = config["initial_partition_point"]  # 初始划分点（论文默认0<par<l）
+        # 队列与到达率
+        self.task_queue: deque = deque(maxlen=self.queue_capacity)
+        self.task_arrival_rate = float(config.get("initial_task_arrival_rate", (self.arrival_low + self.arrival_high) / 2))
 
-        # 加载边缘端子模型（基于当前划分点）
-        self.edge_model = self._get_edge_model(self.current_partition_point)
-        self.edge_model.to(self.device)
-        self.edge_model.eval()
+        # 当前划分点与服务率
+        self.current_partition_point = self.initial_partition_point
+        self.edge_model = self._build_edge_model(self.current_partition_point)       # 仅剩余层与最终头
+        self.edge_model.to(self.device).eval()
+        self.service_rate = self._recompute_service_rate(self.current_partition_point)  # μ
 
-    def _get_edge_model(self, partition_point):
-        """
-        基于论文模型划分逻辑，获取边缘端子模型（剩余层+出口层）
-        :param partition_point: 划分点（par(t)∈{0,1,...,l}）
-        :return: 边缘端子模型
-        """
-        if partition_point < 0 or partition_point > len(self.model.backbone.layers):
-            raise ValueError(f"Partition point must be in [0, {len(self.model.backbone.layers)}] (Paper Eq.15d)")
+    # ------------------------------------------------------------------
+    # 构建边缘端子模型：划分点之后的层 + 最终分类头
+    # ------------------------------------------------------------------
+    def _build_edge_model(self, partition_point: int) -> nn.Module:
+        """将主干剩余层拼成一个顺序模块；最终的主出口由 backbone/head 内部实现。"""
+        if partition_point < 0 or partition_point > len(self.model.backbone):
+            raise ValueError(f"Partition point must be in [0, {len(self.model.backbone)}].")
 
-        # 论文逻辑：边缘端执行划分点后的所有层 + 所有早退出层
-        edge_layers = get_edge_model_layers(self.model.backbone.layers, partition_point)
-        edge_model = nn.Sequential(*edge_layers, *self.model.exit_layers)
-        return edge_model
+        # 仅收集划分点之后的 backbone 层
+        edge_layers = get_edge_model_layers(self.model.backbone, partition_point)
+        # 如果 base_model 的 forward_from 支持从中间层继续，则这里也可只保存 partition_point
+        return nn.Sequential(*edge_layers)
 
-    def update_partition_point(self, new_partition_point):
-        """
-        根据ADP-D3QN决策更新划分点（论文4.2节动作空间）
-        :param new_partition_point: 新划分点（由智能体输出）
-        """
-        self.current_partition_point = new_partition_point
-        self.edge_model = self._get_edge_model(new_partition_point)
-        self.edge_model.to(self.device)
-        self.edge_model.eval()
+    def update_partition_point(self, new_partition_point: int) -> None:
+        """根据 ADP-D3QN 动作更新划分点，重建子模型并更新服务率 μ"""
+        self.current_partition_point = int(new_partition_point)
+        self.edge_model = self._build_edge_model(self.current_partition_point).to(self.device).eval()
+        self.service_rate = self._recompute_service_rate(self.current_partition_point)
 
-        # 更新服务率（论文公式8：μ(t)=C_e/∑c_j，c_j为边缘层计算量）
-        edge_layer_compute = sum([layer.compute_cost for layer in self.edge_model])  # 每层计算量（论文预定义）
-        self.service_rate = self.edge_resource / edge_layer_compute  # 服务率（任务/ms）
+    # ------------------------------------------------------------------
+    # 资源/服务率计算 —— μ = C_e / (Σ c_j)   (Eq.8 的组成项)
+    # ------------------------------------------------------------------
+    def _recompute_service_rate(self, partition_point: int) -> float:
+        """根据剩余层计算量重估 μ（任务/秒），避免写死常数"""
+        remaining_layers = max(0, len(self.model.backbone) - partition_point)
 
-    def add_task_to_queue(self, task_data):
-        """
-        将车端传输的中间特征加入队列（论文3.5节任务堆叠处理）
-        :param task_data: 任务数据（中间特征+车辆ID+时间戳）
-        :return: 是否成功入队
-        """
-        if len(self.task_queue) < self.queue_capacity:
-            self.task_queue.append(task_data)
-            # 更新任务到达率（论文中随机波动±1%）
-            self.task_arrival_rate = np.clip(self.task_arrival_rate + np.random.normal(0, 0.01), 0.15, 0.25)
-            return True
-        return False  # 队列满，任务丢弃（论文中计入任务失败率）
+        # 若模型提供逐层计算量统计则优先使用（与 model_partition.get_model_layer_compute_cost 一致）
+        if hasattr(self.model, "layer_compute") and isinstance(self.model.layer_compute, dict):
+            total_compute_gops = float(sum(self.model.layer_compute.get(i, 0.0) for i in range(partition_point, len(self.model.backbone))))
+        else:
+            # 兜底：每层 per_layer_compute（来自 config），严格不写死在代码里
+            total_compute_gops = float(remaining_layers) * self.per_layer_compute
 
-    def _calculate_queue_delay(self):
-        """
-        计算队列延迟（论文M/D/1模型公式8：λ/(2μ(μ-λ))）
-        :return: 队列延迟（ms）
-        """
-        if self.service_rate <= self.task_arrival_rate:
-            return float("inf")  # 边缘过载，延迟无穷大
-        queue_delay = self.task_arrival_rate / (2 * self.service_rate * (self.service_rate - self.task_arrival_rate))
-        return queue_delay
+        # μ ≈ C_e / 计算量（简化“每任务计算量”，单位对齐到 “任务/秒”的近似）
+        # 注意：这里是宏观仿真近似，供审稿复现实验，不代表真实吞吐测量。
+        mu = self.edge_resource / max(total_compute_gops, 1e-9)
+        return float(mu)
 
-    def _calculate_process_delay(self):
+    # ------------------------------------------------------------------
+    # 入队：车辆上传的中间特征
+    # ------------------------------------------------------------------
+    def add_task_to_queue(self, task: Dict[str, Any]) -> bool:
         """
-        计算边缘端处理延迟（论文公式8：1/μ(t)）
-        :return: 处理延迟（ms）
+        task 需要包含：
+          - "feat": np.ndarray 或 torch.Tensor (B,C,H,W)
+          - "meta": 可选，车辆ID、时间戳等
         """
-        return 1.0 / self.service_rate if self.service_rate > 0 else float("inf")
+        if len(self.task_queue) >= self.queue_capacity:
+            return False
+        self.task_queue.append(task)
 
-    def infer(self, intermediate_feat, labels=None):
+        # 更新 λ：加入轻微噪声（来自 config 的 sigma），并裁剪在范围内
+        self.task_arrival_rate = float(np.clip(
+            self.task_arrival_rate + np.random.normal(0.0, self.arrival_sigma),
+            self.arrival_low, self.arrival_high
+        ))
+        return True
+
+    # ------------------------------------------------------------------
+    # 边缘推理：出队 → 剩余层前向 → 可选早退 → 主出口
+    # ------------------------------------------------------------------
+    def infer(self, labels: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """
-        边缘端推理（论文流程：出队→计算→早退出判断→返回结果）
-        :param intermediate_feat: 车端传输的中间特征（论文中d_l大小）
-        :param labels: 标签（用于计算精度，论文中BDD100K标签）
-        :return: 推理结果（含延迟、精度、是否主出口）
+        从队列取一个任务并完成边缘推理
+        :param labels: 可选标签（B,），仅用于计算精度展示
         """
-        # 1. 任务出队（若队列为空，等待新任务）
         if not self.task_queue:
-            time.sleep(0.001)  # 模拟等待
-            return {"status": "waiting", "delay": 0.0, "accuracy": 0.0}
+            # 无任务；可返回队列状态
+            return {"status": "empty", "delay": 0.0, "accuracy": 0.0, "queue_len": len(self.task_queue)}
 
         task = self.task_queue.popleft()
-        start_time = time.time()
+        feat = task["feat"]
+        if isinstance(feat, np.ndarray):
+            feat = torch.from_numpy(feat)
+        feat = feat.to(self.device, dtype=torch.float32)
 
-        # 2. 边缘端前向计算（剩余层）
+        # 计时（仅用于记录程序执行时间；真正的 M/D/1 延迟由公式给出）
+        wall_t0 = time.time()
+
         with torch.no_grad():
-            intermediate_feat = torch.tensor(intermediate_feat, dtype=torch.float32).to(self.device)
-            edge_feat = self.edge_model(intermediate_feat)
+            # 1) 剩余层前向（backbone 的后半段）
+            edge_feat = self.edge_model(feat)
 
-            # 3. 早退出判断（论文3.4节：基于出口概率pr_i^early）
-            main_prob = torch.nn.functional.softmax(edge_feat, dim=1)
-            exit_probs = self.model.exit_layers  # 各早退出层概率（论文公式6）
-            exit_idx, exit_acc = self.model.get_early_exit_decision(exit_probs)
+            # 2) 边缘侧可选早退：若模型设计允许在边缘侧仍有出口，则对“划分点后的出口”逐一判定
+            exit_idx_used = -1
+            confidence = 0.0
+            if hasattr(self.model, "exit_layers") and len(self.model.exit_layers) > 0:
+                # 将划分点映射为“从哪个出口开始可用”
+                first_exit = self._map_partition_to_first_exit()
+                for e_idx in range(first_exit, len(self.model.exit_layers)):
+                    logits_e = self.model.exit_layers[e_idx](edge_feat)
+                    probs_e = F.softmax(logits_e, dim=1)
+                    conf_e, pred_e = torch.max(probs_e, dim=1)
+                    conf_mean = float(conf_e.mean().item())
+                    if conf_mean >= self.ac_min:
+                        # 触发边缘侧早退
+                        exit_idx_used = e_idx
+                        confidence = conf_mean
+                        final_probs = probs_e
+                        final_pred = pred_e
+                        break
 
-            # 4. 若早退出不满足，使用主出口（论文定义主出口为最后一层）
-            if exit_idx == -1:
-                final_prob = main_prob
-                final_acc = calculate_inference_accuracy(final_prob, labels)
-                is_main_exit = True
-            else:
-                final_prob = exit_probs[exit_idx]
-                final_acc = exit_acc
-                is_main_exit = False
+            # 3) 若未在任何出口早退，则使用“主出口”（模型的最终头）
+            if exit_idx_used == -1:
+                # 假设 base_model 提供 forward_from() 执行剩余 head
+                if hasattr(self.model, "forward_from"):
+                    logits_main = self.model.forward_from(edge_feat, start_layer=len(self.model.backbone))  # 或者 model.head(edge_feat)
+                else:
+                    # 某些实现中 edge_model 已经含有最终 head；这里做兼容
+                    logits_main = edge_feat
+                final_probs = F.softmax(logits_main, dim=1)
+                final_pred = final_probs.argmax(dim=1)
+                confidence = float(final_probs.max(dim=1).values.mean().item())
 
-        # 5. 计算总延迟（论文公式8：处理延迟+队列延迟）
-        process_delay = self._calculate_process_delay()
-        queue_delay = self._calculate_queue_delay()
-        total_delay = (time.time() - start_time) * 1000 + process_delay + queue_delay  # 实际时间+模型延迟
+        # 4) 计算 M/D/1 延迟 (Eq.8)
+        process_delay_ms = self._process_delay_ms()      # 1/μ
+        queue_delay_ms = self._queue_delay_ms()          # λ/[2μ(μ-λ)]
+        model_time_ms = (time.time() - wall_t0) * 1000.0 # 实测代码时间（仅展示）
+        total_delay_ms = process_delay_ms + queue_delay_ms + model_time_ms
+
+        # 5) 能耗估算（与车辆端一致：计算量 × 因子）
+        energy_j = self._edge_energy_j()
+
+        # 6) 可选精度（若提供标签）
+        accuracy = 0.0
+        if labels is not None:
+            labels = labels.to(self.device)
+            accuracy = float((final_pred == labels).float().mean().item())
 
         return {
             "status": "completed",
-            "is_main_exit": is_main_exit,
-            "exit_idx": exit_idx,
-            "delay": total_delay,
-            "accuracy": final_acc,
-            "result": torch.argmax(final_prob, dim=1).cpu().numpy()
+            "exit_idx": exit_idx_used,                 # -1 表示主出口
+            "confidence": confidence,
+            "delay": float(total_delay_ms),
+            "delay_breakdown": {
+                "process_ms": float(process_delay_ms),
+                "queue_ms": float(queue_delay_ms),
+                "overhead_ms": float(model_time_ms)
+            },
+            "energy": float(energy_j),
+            "accuracy": float(accuracy),
+            "queue_len": len(self.task_queue),
+            "partition_point": int(self.current_partition_point)
         }
 
-    def get_queue_status(self):
-        """返回队列状态（论文监控指标：队列长度、任务到达率、服务率）"""
-        return {
-            "queue_length": len(self.task_queue),
-            "task_arrival_rate": self.task_arrival_rate,
-            "service_rate": self.service_rate,
-            "current_partition_point": self.current_partition_point
-        }
+    # ------------------------- 内部计算 -------------------------
+
+    def _map_partition_to_first_exit(self) -> int:
+        """把划分点映射为“从哪个出口开始可用”的索引"""
+        n_layers = len(self.model.backbone)
+        n_exits = len(getattr(self.model, "exit_layers", []))
+        if n_exits == 0:
+            return 0
+        ratio = self.current_partition_point / max(1, n_layers)
+        first_exit = int(np.floor(ratio * n_exits))
+        return min(max(first_exit, 0), n_exits - 1)
+
+    def _process_delay_ms(self) -> float:
+        """处理延迟：1/μ（秒）→ ms"""
+        if self.service_rate <= 0:
+            return float("inf")
+        return float((1.0 / self.service_rate) * 1000.0)
+
+    def _queue_delay_ms(self) -> float:
+        """队列延迟：λ / [2μ(μ-λ)]（秒）→ ms"""
+        mu = self.service_rate
+        lam = self.task_arrival_rate
+        if mu <= lam:
+            return float("inf")
+        return float((lam / (2.0 * mu * (mu - lam))) * 1000.0)
+
+    def _edge_energy_j(self) -> float:
+        """能耗估计：Σ c_j × 因子（J/GOP）"""
+        remaining_layers = max(0, len(self.model.backbone) - self.current_partition_point)
+        if hasattr(self.model, "layer_compute") and isinstance(self.model.layer_compute, dict):
+            total_compute_gops = float(sum(self.model.layer_compute.get(i, 0.0) for i in range(self.current_partition_point, len(self.model.backbone))))
+        else:
+            total_compute_gops = float(remaining_layers) * self.per_layer_compute
+        return float(total_compute_gops * self.energy_factor)
 
 
+# ------------------------------ 简单测试 ------------------------------
 if __name__ == "__main__":
-    # 论文参数配置（基于1-147表格）
-    config = {
-        "edge_device": "cuda:0" if torch.cuda.is_available() else "cpu",
-        "edge_resource": 15.0,  # 边缘计算资源（GHz）
-        "edge_queue_capacity": 50,  # 队列容量
-        "initial_task_arrival_rate": 0.2,  # 初始任务到达率20%
-        "initial_partition_point": 5,  # 初始划分点（VGG16共31层，取第5层后）
-        "num_classes": 10,  # 论文中BDD100K分类任务
-        "ac_min": 0.8  # 最小精度阈值（论文Eq.15）
-    }
-
-    # 加载论文多出口VGG16模型
     from model.vgg16 import MultiExitVGG16
 
-    model = MultiExitVGG16(num_classes=config["num_classes"], ac_min=config["ac_min"])
+    cfg = {
+        "edge_device": "cuda" if torch.cuda.is_available() else "cpu",
+        "edge_resource": 15.0,
+        "edge_queue_capacity": 50,
+        "arrival_rate_range": (0.15, 0.25),
+        "arrival_rate_sigma": 0.01,
+        "initial_task_arrival_rate": 0.2,
+        "initial_partition_point": 5,
+        "ac_min": 0.8,
+        "per_layer_compute": 0.1,
+        "edge_energy_per_gop": 0.04,
+    }
 
-    # 初始化边缘推理器
-    edge_infer = EdgeInference(model=model, config=config)
+    model = MultiExitVGG16(num_classes=10).to(cfg["edge_device"])
+    inferer = EdgeInference(model, cfg)
 
-    # 模拟车端传输中间特征（随机生成，尺寸匹配VGG16划分点5后的输入）
-    intermediate_feat = np.random.randn(1, 128, 56, 56).astype(np.float32)  # VGG16 Block2后特征
-    edge_infer.add_task_to_queue({"feat": intermediate_feat, "vehicle_id": 1, "timestamp": time.time()})
+    # 模拟入队一个任务（Block2 后特征尺寸示例）
+    fake_feat = np.random.randn(1, 128, 56, 56).astype(np.float32)
+    inferer.add_task_to_queue({"feat": fake_feat, "meta": {"vehicle_id": 1}})
 
-    # 边缘端推理
-    result = edge_infer.infer(intermediate_feat, labels=np.array([3]))  # 模拟标签3
-    print("Edge Inference Result (Paper VGG16):")
-    print(
-        f"Total Delay: {result['delay']:.2f}ms | Accuracy: {result['accuracy']:.4f} | Main Exit: {result['is_main_exit']}")
-    print("Queue Status:", edge_infer.get_queue_status())
+    # 推理
+    out = inferer.infer()
+    print("[Edge] result:", {k: (round(v, 3) if isinstance(v, float) else v) for k, v in out.items() if k != "delay_breakdown"})
+    print("[Edge] delay breakdown (ms):", {k: round(v, 3) for k, v in out["delay_breakdown"].items()})

@@ -1,48 +1,63 @@
+import cv2
 import numpy as np
 import random
 
-def augment_image(img):
+
+def augment_image(img: np.ndarray) -> np.ndarray:
     """
-    图像数据增强（论文5.1节提及的随机翻转、亮度调整策略）
-    :param img: 输入图像（np.ndarray, (C,H,W)）
+    图像数据增强（论文 5.1 节）
+    :param img: 输入图像 (np.ndarray, (C,H,W))
     :return: 增强后图像
     """
-    # 1. 随机水平翻转（50%概率，论文数据增强常用策略）
-    if random.random() > 0.5:
-        img = np.flip(img, axis=2)  # 沿宽度轴翻转
+    # 1. 随机水平翻转 (50%)
+    if random.random() < 0.5:
+        img = np.flip(img, axis=2)
 
-    # 2. 随机亮度调整（±10%，避免过曝/欠曝）
+    # 2. 随机亮度 ±10%
     brightness = random.uniform(0.9, 1.1)
-    img = img * brightness
-    img = np.clip(img, 0.0, 1.0)  # 裁剪到[0,1]范围
+    img = np.clip(img * brightness, 0.0, 1.0)
 
-    # 3. 随机对比度调整（±10%，增强特征区分度）
-    if random.random() > 0.5:
-        mean = np.mean(img, axis=(1, 2), keepdims=True)  # 通道均值
+    # 3. 随机对比度 ±10%
+    if random.random() < 0.5:
+        mean = np.mean(img, axis=(1, 2), keepdims=True)
         contrast = random.uniform(0.9, 1.1)
-        img = (img - mean) * contrast + mean
-        img = np.clip(img, 0.0, 1.0)
+        img = np.clip((img - mean) * contrast + mean, 0.0, 1.0)
 
-    return img
+    # 4. 随机高斯噪声 (σ≈0.01)
+    if random.random() < 0.3:
+        noise = np.random.normal(0, 0.01, img.shape).astype(np.float32)
+        img = np.clip(img + noise, 0.0, 1.0)
 
-def resize_with_pad(img, target_size=(224, 224)):
+    # 5. 小角度旋转 (±5°)
+    if random.random() < 0.3:
+        c, h, w = img.shape
+        center = (w // 2, h // 2)
+        angle = random.uniform(-5, 5)
+        rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+        img_cv = np.transpose(img, (1, 2, 0))  # C,H,W→H,W,C
+        img_cv = cv2.warpAffine(img_cv, rot_mat, (w, h), borderValue=(0, 0, 0))
+        img = np.transpose(img_cv, (2, 0, 1))
+
+    return img.astype(np.float32)
+
+
+def resize_with_pad(img: np.ndarray, target_size=(224, 224)):
     """
-    等比例缩放+补边（避免图像畸变，适配目标检测任务扩展）
-    :param img: 输入图像（np.ndarray, (H,W,C)）
-    :param target_size: 目标尺寸（H,W）
+    等比例缩放+灰边填充 (论文 5.1 节扩展到检测任务)
+    :param img: (H,W,C)
     :return: 缩放后图像、缩放比例、补边信息
     """
     h, w = img.shape[:2]
     th, tw = target_size
-    # 计算缩放比例（保持宽高比）
     scale = min(tw / w, th / h)
     nw, nh = int(w * scale), int(h * scale)
-    # 缩放图像
     img = cv2.resize(img, (nw, nh))
-    # 计算补边（灰色填充，避免干扰特征）
     pad_left = (tw - nw) // 2
     pad_right = tw - nw - pad_left
     pad_top = (th - nh) // 2
     pad_bottom = th - nh - pad_top
-    img = cv2.copyMakeBorder(img, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=(128, 128, 128))
+    img = cv2.copyMakeBorder(
+        img, pad_top, pad_bottom, pad_left, pad_right,
+        cv2.BORDER_CONSTANT, value=(128, 128, 128)
+    )
     return img, scale, (pad_left, pad_top)

@@ -6,112 +6,114 @@ from model.base_model import BaseMultiExitModel
 class MultiExitAlexNet(BaseMultiExitModel):
     """
     多出口AlexNet（论文3.4节：4个早退出点，适配VEC场景）
-    基于原始AlexNet改造，在卷积层后添加早退出分支
+    改进点：
+      ✅ 支持 return_exit_probs 参数；
+      ✅ 注册每层 compute_cost；
+      ✅ 支持 register_exit_layer() 接口；
+      ✅ 对齐 EdgeInference/VehicleInference 调用。
     """
 
     def __init__(self, num_classes=7, ac_min=0.8):
         super().__init__(num_classes=num_classes, ac_min=ac_min)
-        self._build_backbone()  # 构建主干网络
-        self._register_exit_layers()  # 注册4个早退出层（论文1-59）
-        self.calculate_layer_compute_cost()  # 计算每层计算量
+        self._build_backbone()
+        self._register_exit_layers()
+        self.calculate_layer_compute_cost()
+        print(f"[Model Init] MultiExitAlexNet initialized with {len(self.exit_layers)} exits")
 
     def _build_backbone(self):
         """构建AlexNet主干网络（论文3.4节结构）"""
         self.backbone = nn.Sequential(
             # 卷积块1
-            nn.Conv2d(3, 96, kernel_size=11, stride=4, padding=2),  # 0
-            nn.ReLU(inplace=True),  # 1
-            nn.LocalResponseNorm(size=5, alpha=0.0001, beta=0.75, k=2),  # 2
-            nn.MaxPool2d(kernel_size=3, stride=2),  # 3（早退出挂钩点1）
+            nn.Conv2d(3, 96, kernel_size=11, stride=4, padding=2),
+            nn.ReLU(inplace=True),
+            nn.LocalResponseNorm(size=5, alpha=0.0001, beta=0.75, k=2),
+            nn.MaxPool2d(kernel_size=3, stride=2),  # Exit 1
 
             # 卷积块2
-            nn.Conv2d(96, 256, kernel_size=5, padding=2),  # 4
-            nn.ReLU(inplace=True),  # 5
-            nn.LocalResponseNorm(size=5, alpha=0.0001, beta=0.75, k=2),  # 6
-            nn.MaxPool2d(kernel_size=3, stride=2),  # 7（早退出挂钩点2）
+            nn.Conv2d(96, 256, kernel_size=5, padding=2),
+            nn.ReLU(inplace=True),
+            nn.LocalResponseNorm(size=5, alpha=0.0001, beta=0.75, k=2),
+            nn.MaxPool2d(kernel_size=3, stride=2),  # Exit 2
 
             # 卷积块3
-            nn.Conv2d(256, 384, kernel_size=3, padding=1),  # 8
-            nn.ReLU(inplace=True),  # 9
+            nn.Conv2d(256, 384, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
 
             # 卷积块4
-            nn.Conv2d(384, 384, kernel_size=3, padding=1),  # 10
-            nn.ReLU(inplace=True),  # 11
+            nn.Conv2d(384, 384, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
 
             # 卷积块5
-            nn.Conv2d(384, 256, kernel_size=3, padding=1),  # 12
-            nn.ReLU(inplace=True),  # 13
-            nn.MaxPool2d(kernel_size=3, stride=2),  # 14（早退出挂钩点3）
+            nn.Conv2d(384, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2),  # Exit 3
 
-            # 全连接块
-            nn.Flatten(),  # 15
-            nn.Linear(256 * 6 * 6, 4096),  # 16
-            nn.ReLU(inplace=True),  # 17
-            nn.Dropout(p=0.5),  # 18（早退出挂钩点4）
-            nn.Linear(4096, 4096),  # 19
-            nn.ReLU(inplace=True),  # 20
-            nn.Dropout(p=0.5),  # 21
-            nn.Linear(4096, self.num_classes)  # 22（主出口）
+            # 全连接部分
+            nn.Flatten(),
+            nn.Linear(256 * 6 * 6, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),  # Exit 4
+            nn.Linear(4096, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(4096, self.num_classes)  # Main exit
         )
 
-        # 早退出挂钩点（论文3.4节：4个早退出位置）
+        # 早退出挂钩点
         self.exit_hook_points = [3, 7, 14, 18]
 
     def _register_exit_layers(self):
-        """注册4个早退出层（适配各挂钩点特征尺寸，论文3.4节）"""
-        # 早退出1（挂钩点3：(B,96,13,13)→(B,num_classes)）
-        self.register_exit_layer(nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),  # 全局平均池化
-            nn.Flatten(),
-            nn.Linear(96, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, self.num_classes)
-        ))
+        """注册4个早退出层（论文1-59表）"""
+        exits = [
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
+                nn.Linear(96, 256), nn.ReLU(inplace=True), nn.Linear(256, self.num_classes)
+            ),
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
+                nn.Linear(256, 512), nn.ReLU(inplace=True), nn.Linear(512, self.num_classes)
+            ),
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
+                nn.Linear(256, 512), nn.ReLU(inplace=True), nn.Linear(512, self.num_classes)
+            ),
+            nn.Sequential(
+                nn.Linear(4096, 1024), nn.ReLU(inplace=True), nn.Linear(1024, self.num_classes)
+            )
+        ]
+        for e in exits:
+            self.register_exit_layer(e)
 
-        # 早退出2（挂钩点7：(B,256,6,6)→(B,num_classes)）
-        self.register_exit_layer(nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(256, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, self.num_classes)
-        ))
+    def calculate_layer_compute_cost(self):
+        """计算每层计算量，用于资源分配（论文Eq.15d）"""
+        for i, layer in enumerate(self.backbone):
+            if isinstance(layer, nn.Conv2d):
+                in_c, out_c, k_h, k_w = layer.weight.shape
+                layer.compute_cost = in_c * out_c * k_h * k_w / 1e6  # 简化为MFlops
+            elif isinstance(layer, nn.Linear):
+                layer.compute_cost = layer.in_features * layer.out_features / 1e6
+            else:
+                layer.compute_cost = 0.0
 
-        # 早退出3（挂钩点14：(B,256,6,6)→(B,num_classes)）
-        self.register_exit_layer(nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(256, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, self.num_classes)
-        ))
-
-        # 早退出4（挂钩点18：(B,4096)→(B,num_classes)）
-        self.register_exit_layer(nn.Sequential(
-            nn.Linear(4096, 1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, self.num_classes)
-        ))
+    def forward(self, x, return_exit_probs=False):
+        """前向传播（支持早退出概率输出）"""
+        exit_probs = []
+        for i, layer in enumerate(self.backbone):
+            x = layer(x)
+            if i in self.exit_hook_points:
+                exit_idx = self.exit_hook_points.index(i)
+                prob = self.exit_layers[exit_idx](x)
+                exit_probs.append(prob)
+        if return_exit_probs:
+            return x, exit_probs
+        return x
 
 
 if __name__ == "__main__":
-    # 测试代码（论文实验参数）
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = MultiExitAlexNet(num_classes=7, ac_min=0.8).to(device)
-
-    # 测试前向传播与早退出
-    x = torch.randn(8, 3, 224, 224).to(device)  # (B,C,H,W)
+    x = torch.randn(8, 3, 224, 224).to(device)
     main_prob, exit_probs = model(x, return_exit_probs=True)
-    print(f"AlexNet Main Exit shape: {main_prob.shape} (Paper 3.4节)")
-    print(f"Number of early exits: {len(exit_probs)} (Paper 4 exits)")
-    for i, prob in enumerate(exit_probs):
-        print(f"Early Exit {i + 1} shape: {prob.shape}")
-
-    # 测试早退出决策
-    exit_idx, acc = model.get_early_exit_decision(exit_probs)
-    print(f"Early Exit Index: {exit_idx}, Accuracy: {acc:.4f} (Threshold: 0.8)")
-
-    # 测试模型划分（划分点=10，车端执行前10层）
-    vehicle_model, edge_model = model.partition_model(partition_point=10)
-    print(f"Vehicle model layers: {len(vehicle_model)}")
-    print(f"Edge model layers: {len(edge_model)}")
+    print(f"Main Output: {main_prob.shape}, Exits: {len(exit_probs)}")
+    for i, p in enumerate(exit_probs):
+        print(f"Exit {i+1} -> {p.shape}")

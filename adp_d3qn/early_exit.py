@@ -1,130 +1,134 @@
-import numpy as np
 import torch
+import torch.nn.functional as F
+import numpy as np
 from model.base_model import BaseMultiExitModel
 
 
-def calculate_early_exit_probability(model: BaseMultiExitModel, partition_point):
+# ------------------------------------------------------------
+# Eq.(6): pr_i^early = (Π_{j=1}^{i-1}(1 - pr_j)) * pr_i
+# ------------------------------------------------------------
+def calculate_early_exit_probability(model: BaseMultiExitModel, partition_point: int, dataloader=None, device="cpu"):
     """
-    计算早退出概率（论文公式6：pr_i^early = ∏(1-pr_j) * pr_i，j=1到i）
-    :param model: 多出口模型（AlexNet4个出口/VGG165个出口）
-    :param partition_point: 划分点（确定车端可访问的出口层）
-    :return: 各出口早退出概率列表
+    动态计算多出口模型的早退出概率 (Eq.6)
+    若提供 dataloader，则根据 softmax 输出置信度动态估算 pr_i；
+    否则使用模型中缓存的统计均值。
     """
-    # 论文1-64：离线预计算的出口优先级概率pr_i（0≤pr_i≤1）
-    if isinstance(model, model.__class__.__name__ == "MultiExitAlexNet"):
-        # AlexNet4个早退出点（论文1-59：Exit1-Exit4）
-        pr = [0.1, 0.2, 0.3, 0.4, 1.0]  # 最后一个为主出口（pr=1.0）
-    elif isinstance(model, model.__class__.__name__ == "MultiExitVGG16"):
-        # VGG165个早退出点（论文1-59：Exit1-Exit5）
-        pr = [0.05, 0.15, 0.25, 0.35, 0.45, 1.0]  # 最后一个为主出口
+    model.eval()
+    exit_layers = model.exit_layers
+    num_exits = len(exit_layers)
+
+    # ---- Step 1. 估算每个出口的平均置信度 pr_i ----
+    if dataloader is not None:
+        conf_list = torch.zeros(num_exits, device=device)
+        count = 0
+        with torch.no_grad():
+            for batch in dataloader:
+                imgs = batch["image"].to(device)
+                feat = model.forward_until(imgs, partition_point)  # 划分点前的特征
+                for i, exit_layer in enumerate(exit_layers):
+                    logits = exit_layer(feat)
+                    probs = F.softmax(logits, dim=1)
+                    conf = probs.max(dim=1)[0].mean()
+                    conf_list[i] += conf
+                count += 1
+                if count >= 10:  # 仅采样前10个batch估计即可
+                    break
+        pr = (conf_list / count).cpu().numpy().tolist()
     else:
-        raise ValueError("Only AlexNet/VGG16 supported (Paper Experiment)")
+        # 若未提供数据，则使用模型保存的统计结果或经验均值
+        pr = getattr(model, "exit_confidence", [0.2 + 0.1 * i for i in range(num_exits)])
 
-    # 确定车端可访问的出口层（划分点前的出口）
-    exit_count = len(model.exit_layers)
-    accessible_exits = min(partition_point // (len(model.backbone.layers) // exit_count), exit_count)
+    # ---- Step 2. 计算每个出口的早退出概率 Eq.(6) ----
     early_exit_probs = []
-
-    # 论文公式6计算每个出口的早退出概率
-    for i in range(accessible_exits):
-        product_term = np.prod([1 - pr[j] for j in range(i)])  # ∏(1-pr_j)，j=1到i-1
-        pr_early = product_term * pr[i]
+    for i in range(num_exits):
+        prior = np.prod([1 - pr[j] for j in range(i)])
+        pr_early = prior * pr[i]
         early_exit_probs.append(pr_early)
 
-    # 主出口概率（所有早退出都不触发的概率）
-    main_exit_prob = np.prod([1 - pr[j] for j in range(accessible_exits)]) * pr[-1]
+    # 主出口（所有早退都未触发）
+    main_exit_prob = np.prod([1 - pr[j] for j in range(num_exits)])
     early_exit_probs.append(main_exit_prob)
-
     return early_exit_probs
 
 
+# ------------------------------------------------------------
+# Eq.(7): ac_i(t) ≥ ac_min  精度约束检查
+# ------------------------------------------------------------
 def validate_early_exit_accuracy(model: BaseMultiExitModel, dataloader, partition_point, config):
     """
-    验证早退出精度（论文5.4.2节：确保ac_i(t)≥ac_min）
-    :param model: 多出口模型
-    :param dataloader: 验证数据集（论文BDD100K）
-    :param partition_point: 划分点
-    :param config: 配置（含ac_min）
-    :return: 各出口精度列表（是否满足阈值）
+    验证早退出出口的推理精度 (Eq.7)
+    保证 ac_i(t) ≥ ac_min
     """
     model.eval()
     device = config["device"]
-    exit_accuracies = []
     ac_min = config["ac_min"]
+    exit_accuracies = []
 
     with torch.no_grad():
         for batch in dataloader:
             imgs = batch["image"].to(device)
             labels = batch["label"].to(device)
 
-            # 车端前向（划分点前层）
-            vehicle_model, _ = model.partition_model(partition_point)
-            vehicle_feat = vehicle_model(imgs)
+            # 提取划分点前的特征
+            feat = model.forward_until(imgs, partition_point)
 
-            # 计算各出口精度
             for exit_idx, exit_layer in enumerate(model.exit_layers):
-                # 仅计算划分点可访问的出口
-                if exit_idx > min(partition_point // (len(model.backbone.layers) // len(model.exit_layers)),
-                                  len(model.exit_layers) - 1):
-                    continue
-
-                exit_prob = exit_layer(vehicle_feat)
-                pred = torch.argmax(exit_prob, dim=1)
-                accuracy = (pred == labels).float().mean().item()
+                logits = exit_layer(feat)
+                pred = logits.argmax(dim=1)
+                acc = (pred == labels).float().mean().item()
                 exit_accuracies.append({
                     "exit_idx": exit_idx,
-                    "accuracy": accuracy,
-                    "meets_threshold": accuracy >= ac_min
+                    "accuracy": acc,
+                    "meets_threshold": acc >= ac_min
                 })
 
-            # 主出口精度
-            main_prob = model(imgs)
-            main_pred = torch.argmax(main_prob, dim=1)
-            main_accuracy = (main_pred == labels).float().mean().item()
+            # 主出口验证
+            final_pred = model(imgs).argmax(dim=1)
+            final_acc = (final_pred == labels).float().mean().item()
             exit_accuracies.append({
                 "exit_idx": "main",
-                "accuracy": main_accuracy,
-                "meets_threshold": main_accuracy >= ac_min
+                "accuracy": final_acc,
+                "meets_threshold": final_acc >= ac_min
             })
-            break  # 简化：仅验证一个批次
-
+            break  # 仅验证一批次即可
     return exit_accuracies
 
 
+# ------------------------------------------------------------
+# 测试示例
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    # 测试：计算VGG16早退出概率与精度
     from model.vgg16 import MultiExitVGG16
     from dataset.bdd100k_processor import get_bdd100k_dataloader
-    from config import Config
 
-    # 配置（论文参数）
-    config = Config()
-    config.data_root = "/path/to/bdd100k"
-    config.batch_size = 8
-    config.img_size = (224, 224)
-    config.ac_min = 0.8
+    # === Config ===
+    config = {
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "data_root": "/path/to/bdd100k",
+        "batch_size": 8,
+        "img_size": (224, 224),
+        "ac_min": 0.8,
+    }
 
-    # 模型与数据加载
-    model = MultiExitVGG16(num_classes=10, ac_min=config.ac_min)
+    # === Model & Data ===
+    model = MultiExitVGG16(num_classes=10).to(config["device"])
     dataloader = get_bdd100k_dataloader(
-        data_root=config.data_root,
+        data_root=config["data_root"],
         split="val",
-        batch_size=config.batch_size,
-        img_size=config.img_size,
-        augment=False
+        batch_size=config["batch_size"],
+        img_size=config["img_size"]
     )
 
-    # 计算早退出概率（划分点=10，VGG16Block2后）
+    # === Example ===
     partition_point = 10
-    early_exit_probs = calculate_early_exit_probability(model, partition_point)
-    print("VGG16 Early Exit Probabilities (Paper Eq.6):")
-    for i, prob in enumerate(early_exit_probs[:-1]):
-        print(f"Exit {i + 1}: {prob:.4f}")
-    print(f"Main Exit: {early_exit_probs[-1]:.4f}")
+    early_exit_probs = calculate_early_exit_probability(model, partition_point, dataloader, device=config["device"])
+    print("\n[Eq.6] Early Exit Probabilities:")
+    for i, p in enumerate(early_exit_probs[:-1]):
+        print(f"  Exit {i+1}: {p:.4f}")
+    print(f"  Main Exit: {early_exit_probs[-1]:.4f}")
 
-    # 验证早退出精度
-    exit_accuracies = validate_early_exit_accuracy(model, dataloader, partition_point, config)
-    print("\nVGG16 Early Exit Accuracies (Paper 5.4.2):")
-    for acc_info in exit_accuracies:
-        status = "✓" if acc_info["meets_threshold"] else "✗"
-        print(f"Exit {acc_info['exit_idx']}: {acc_info['accuracy']:.4f} (Threshold {config.ac_min}: {status})")
+    acc_info = validate_early_exit_accuracy(model, dataloader, partition_point, config)
+    print("\n[Eq.7] Early Exit Accuracy Check:")
+    for info in acc_info:
+        mark = "✓" if info["meets_threshold"] else "✗"
+        print(f"  Exit {info['exit_idx']}: {info['accuracy']:.3f} (≥{config['ac_min']} {mark})")
