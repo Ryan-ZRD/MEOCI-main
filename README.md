@@ -277,17 +277,36 @@ visualization/
 ### 🧩 Convergence Analysis (Fig. 7)
 
 ```bash
-python visualization/plot_convergence.py --input results/reward_log.csv
+python ablation_run.py
+python -c "from metrics_plot import plot_convergence; plot_convergence()"
 ```
 
-📊 Visualization Result:
+📊 Outputs:
+results/D3QN/reward_log.csv      
+results/D3QN/latency_log.csv
+results/A-D3QN/...
+results/DP-D3QN/...
+results/ADP-D3QN/...
+results/Fig7_a_Reward.png
+results/Fig7_b_Latency.png
+
+
+
+<table align="center">
+  <tr>
+    <td align="center" width="50%">
+      <img src="https://meoci.oss-cn-beijing.aliyuncs.com/Figure/P1.png" alt="(a) Reward" width="95%"/><br>
+      <b>(a) Reward</b>
+    </td>
+    <td align="center" width="50%">
+      <img src="https://meoci.oss-cn-beijing.aliyuncs.com/Figure/TS2.png" alt="(b) Latency" width="95%"/><br>
+      <b>(b) Latency</b>
+    </td>
+  </tr>
+</table>
 
 <p align="center">
-  <img src="https://meoci.oss-cn-beijing.aliyuncs.com/Figure/P1.png" alt="Fig7" width="45%"/>
-</p>
-
-<p align="center">
-  <b>Fig. 7.</b> Comparison of convergence between different algorithmic and environmental settings.
+  <b>Fig. 7.</b> Algorithm Ablation Studies.
 </p>
 
 Description:
