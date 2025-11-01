@@ -120,6 +120,32 @@ class Config:
         self.save_interval = 100
         self.log_interval = 10
 
+        # === 与 Agent / Training 对齐的别名与新增 ===
+        # 设备：training.py 用 config.device，这里以 edge_device 为准
+        self.device = self.edge_device
+
+        # batch_size：training.py 用 batch_size；原配置为 drl_batch_size
+        self.batch_size = getattr(self, "drl_batch_size", 128)
+
+        # epsilon 命名统一
+        self.epsilon_max = getattr(self, "epsilon_max", 1.0)
+        self.epsilon_min = getattr(self, "epsilon_min", 0.01)
+        self.epsilon_decay = getattr(self, "epsilon_decay", 0.995)
+
+        # 经验池容量
+        self.buffer_size = getattr(self, "exp_pool_size", 3000)
+
+        # 目标网络更新
+        self.update_freq = getattr(self, "target_update_freq", 10)
+
+        # 高样本采样比例
+        self.lambda_high = getattr(self, "sample_ratio", 0.7)
+
+        # 结果目录（按变体分子目录）
+        self.variant = getattr(self, "variant", "ADP-D3QN")
+        self.results_dir = os.path.join("results", self.variant)
+        os.makedirs(self.results_dir, exist_ok=True)
+
         # ==========================================================
         # 9. 输出确认
         # ==========================================================
